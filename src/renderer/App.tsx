@@ -1,0 +1,706 @@
+import React, { useState, useCallback, useEffect, useRef } from 'react';
+import { AppStateProvider, useAppState, useAppDispatch } from './state/AppStateProvider';
+import { file, app } from './lib/tauri-bridge';
+import { ConfirmDialog, ConfirmResult } from './components/ConfirmDialog';
+import { PasswordDialog, PasswordResult } from './components/PasswordDialog';
+import { Sidebar, Operation } from './components/Sidebar';
+import { ThumbnailGrid } from './components/ThumbnailGrid';
+import { PageInspector } from './components/PageInspector';
+import { MergePanel } from './panels/MergePanel';
+import { SplitPanel } from './panels/SplitPanel';
+import { RotatePanel } from './panels/RotatePanel';
+import { DeletePanel } from './panels/DeletePanel';
+import { CompressPanel } from './panels/CompressPanel';
+import { PdfaPanel } from './panels/PdfaPanel';
+import { EncryptPanel } from './panels/EncryptPanel';
+import { DecryptPanel } from './panels/DecryptPanel';
+import { ExtractTextPanel } from './panels/ExtractTextPanel';
+import { MetadataPanel } from './panels/MetadataPanel';
+import { RepairPanel } from './panels/RepairPanel';
+import { RebuildPanel } from './panels/RebuildPanel';
+import { RecoverPanel } from './panels/RecoverPanel';
+import { GrayscalePanel } from './panels/GrayscalePanel';
+import { OptimizePanel } from './panels/OptimizePanel';
+import { PdfVersionPanel } from './panels/PdfVersionPanel';
+import { useEngine } from './hooks/useEngine';
+import { DropZone } from './components/DropZone';
+import { OperationQueue } from './components/OperationQueue';
+import { QueueProvider, useOperationQueue } from './hooks/useOperationQueue';
+import { SettingsPanel, getSettings } from './panels/SettingsPanel';
+import { WelcomeScreen } from './components/WelcomeScreen';
+import { UpdateBar } from './components/UpdateBar';
+import { installTestHarness, TEST_HARNESS_ENABLED } from './testHarness';
+import type { TestStateSnapshot } from './testHarness';
+
+type ViewMode = 'operations' | 'pages';
+
+const panels: Record<Operation, React.ComponentType> = {
+  merge: MergePanel, split: SplitPanel, rotate: RotatePanel, delete: DeletePanel,
+  compress: CompressPanel, grayscale: GrayscalePanel, optimize: OptimizePanel,
+  pdfa: PdfaPanel, pdf_version: PdfVersionPanel,
+  encrypt: EncryptPanel, decrypt: DecryptPanel,
+  extract_text: ExtractTextPanel, metadata: MetadataPanel,
+  repair: RepairPanel, rebuild: RebuildPanel, recover: RecoverPanel,
+};
+
+const titles: Record<Operation, string> = {
+  merge: 'Merge PDFs', split: 'Split by Range', rotate: 'Rotate Pages', delete: 'Delete Pages',
+  compress: 'Compress', grayscale: 'Convert to Grayscale', optimize: 'Optimize PDF',
+  pdfa: 'Convert to PDF/A', pdf_version: 'Set PDF Version',
+  encrypt: 'Encrypt PDF', decrypt: 'Decrypt PDF',
+  extract_text: 'Extract Text', metadata: 'Edit Metadata',
+  repair: 'Repair PDF', rebuild: 'Rebuild PDF', recover: 'Recover Pages',
+};
+
+function AppContent(): React.ReactElement {
+  const [view, setView] = useState<ViewMode | 'welcome'>(() =>
+    localStorage.getItem('spectra-skip-welcome') === 'true' ? 'operations' : 'welcome'
+  );
+  const [activeOp, setActiveOp] = useState<Operation>('merge');
+  const [showSettings, setShowSettings] = useState(false);
+  const { items: queue, clear: clearQueue } = useOperationQueue();
+  const [extractPage, setExtractPage] = useState<number | null>(null);
+  const [recentFiles, setRecentFiles] = useState<string[]>(() => {
+    try { return JSON.parse(localStorage.getItem('spectra-recent') || '[]'); } catch { return []; }
+  });
+  const [appVersion, setAppVersion] = useState('');
+  const [pagesSidebarWidth, setPagesSidebarWidth] = useState(192);
+  const state = useAppState();
+  const dispatch = useAppDispatch();
+  const { call, openFiles, saveFile } = useEngine();
+
+  // 3-choice confirm dialog state (Save / Don't Save / Cancel)
+  const [confirmState, setConfirmState] = useState<{
+    message: string;
+    resolve: (result: ConfirmResult) => void;
+  } | null>(null);
+
+  // Password prompt dialog state
+  const [passwordState, setPasswordState] = useState<{
+    fileName: string;
+    error?: string;
+    resolve: (result: PasswordResult) => void;
+  } | null>(null);
+
+  const showPasswordPrompt = useCallback((fileName: string, error?: string): Promise<PasswordResult> => {
+    return new Promise((resolve) => {
+      setPasswordState({ fileName, error, resolve });
+    });
+  }, []);
+
+  const handlePasswordResult = useCallback((result: PasswordResult) => {
+    if (passwordState) {
+      passwordState.resolve(result);
+      setPasswordState(null);
+    }
+  }, [passwordState]);
+
+  const showConfirm = useCallback((message: string): Promise<ConfirmResult> => {
+    return new Promise((resolve) => {
+      setConfirmState({ message, resolve });
+    });
+  }, []);
+
+  const handleConfirmResult = useCallback((result: ConfirmResult) => {
+    if (confirmState) {
+      confirmState.resolve(result);
+      setConfirmState(null);
+    }
+  }, [confirmState]);
+
+  // Fetch app version on mount
+  useEffect(() => {
+    app.getVersion().then((v) => setAppVersion(`v${v}`));
+  }, []);
+
+  const addRecent = useCallback((filePath: string) => {
+    setRecentFiles((prev) => {
+      const next = [filePath, ...prev.filter((f) => f !== filePath)].slice(0, 10);
+      localStorage.setItem('spectra-recent', JSON.stringify(next));
+      return next;
+    });
+  }, []);
+
+  const activeFile = state.activeFileId ? state.files.get(state.activeFileId) : null;
+  const allFiles = Array.from(state.files.values());
+
+  // Reload the working copy buffer and page count into state
+  const reloadFile = useCallback(async (filePath: string) => {
+    const f = state.files.get(filePath);
+    if (!f) return;
+    const buffer = await file.readBuffer(f.workingPath);
+    const info = await call('get_page_count', { file: f.workingPath });
+    return { buffer, pageCount: info.pages };
+  }, [state.files, call]);
+
+  const openByPaths = useCallback(async (paths: string[]) => {
+    for (const filePath of paths) {
+      if (state.files.has(filePath)) {
+        dispatch({ type: 'SET_ACTIVE_FILE', path: filePath });
+        addRecent(filePath);
+        continue;
+      }
+      const workingPath = await file.createWorkingCopy(filePath);
+      const fileName = filePath.split(/[\\/]/).pop() || filePath;
+
+      // Check if encrypted and prompt for password if needed
+      const encStatus = await call('check_encrypted', { file: workingPath });
+      if (encStatus.encrypted) {
+        let unlocked = false;
+        let error: string | undefined;
+        while (!unlocked) {
+          const result = await showPasswordPrompt(fileName, error);
+          if (result === 'cancel') break;
+          try {
+            await call('unlock', { file: workingPath, password: result.password });
+            unlocked = true;
+          } catch {
+            error = 'Incorrect password. Please try again.';
+          }
+        }
+        if (!unlocked) continue; // User cancelled — skip this file
+      }
+
+      const buffer = await file.readBuffer(workingPath);
+      const info = await call('get_page_count', { file: workingPath });
+      dispatch({
+        type: 'OPEN_FILE',
+        path: filePath,
+        workingPath,
+        name: fileName,
+        pageCount: info.pages,
+        buffer,
+      });
+      addRecent(filePath);
+    }
+  }, [state.files, call, dispatch, addRecent, showPasswordPrompt]);
+
+  // Drag-drop handler: open files, then navigate based on count
+  const handleFilesDropped = useCallback(async (paths: string[]) => {
+    await openByPaths(paths);
+    if (paths.length === 0) return;
+    if (paths.length >= 2) {
+      setView('operations');
+      setActiveOp('merge');
+    } else {
+      setView('pages');
+    }
+  }, [openByPaths]);
+
+  const handleOpenFile = useCallback(async (): Promise<boolean> => {
+    const paths = await openFiles();
+    if (paths.length > 0) {
+      await openByPaths(paths);
+      return true;
+    }
+    return false;
+  }, [openFiles, openByPaths]);
+
+  const handleWelcomeAction = useCallback(async (action: string) => {
+    if (action === 'open') {
+      if (state.files.size > 0) {
+        setView('pages');
+      } else {
+        const opened = await handleOpenFile();
+        if (opened) setView('pages');
+      }
+    } else if (action === 'merge') {
+      setView('operations');
+      setActiveOp('merge');
+    } else if (action === 'compress') {
+      setView('operations');
+      setActiveOp('compress');
+    } else if (action === 'secure') {
+      setView('operations');
+      setActiveOp('encrypt');
+    } else if (action === 'content') {
+      setView('operations');
+      setActiveOp('extract_text');
+    } else if (action === 'recent' && recentFiles.length > 0) {
+      await openByPaths([recentFiles[0]]);
+      setView('pages');
+    } else if (action.startsWith('open:')) {
+      await openByPaths([action.slice(5)]);
+      setView('pages');
+    }
+  }, [handleOpenFile, openByPaths, recentFiles, state.files]);
+
+  // Snapshot + perform operation + reload
+  const performOperation = useCallback(async (
+    filePath: string,
+    method: string,
+    params: Record<string, unknown>,
+  ) => {
+    const f = state.files.get(filePath);
+    if (!f) return;
+    // Snapshot before mutation
+    const snapshotPath = await file.snapshot(f.workingPath);
+    // Perform operation on working copy
+    await call(method, { ...params, file: f.workingPath, output: f.workingPath });
+    // Reload
+    const result = await reloadFile(filePath);
+    if (result) {
+      dispatch({ type: 'UPDATE_FILE', path: filePath, pageCount: result.pageCount, buffer: result.buffer, snapshotPath });
+    }
+  }, [state.files, call, reloadFile, dispatch]);
+
+  const handleRotatePage = useCallback(async (page: number, angle: number) => {
+    if (!state.activeFileId) return;
+    await performOperation(state.activeFileId, 'rotate', { pages: [page], angle });
+  }, [state.activeFileId, performOperation]);
+
+  const handleDeletePage = useCallback(async (page: number) => {
+    if (!state.activeFileId) return;
+    await performOperation(state.activeFileId, 'delete', { pages: [page] });
+    dispatch({ type: 'SET_ACTIVE_PAGE', page: null });
+  }, [state.activeFileId, performOperation, dispatch]);
+
+  const handleExtractTextFromPage = useCallback(async (page: number) => {
+    if (!activeFile) return;
+    // Switch to Tools > Extract Text with the page pre-selected
+    setView('operations');
+    setActiveOp('extract_text');
+    // Store the page number so the panel can pick it up
+    setExtractPage(page);
+  }, [activeFile]);
+
+  const handleUndo = useCallback(async () => {
+    if (!activeFile || activeFile.undoStack.length === 0) return;
+    const snapshotPath = activeFile.undoStack[activeFile.undoStack.length - 1];
+    await file.restoreSnapshot(activeFile.workingPath, snapshotPath);
+    dispatch({ type: 'UNDO', path: activeFile.path });
+    const result = await reloadFile(activeFile.path);
+    if (result) {
+      // Update buffer/pageCount without pushing to undo stack
+      const files = new Map(state.files);
+      const f = files.get(activeFile.path);
+      if (f) {
+        files.set(activeFile.path, { ...f, buffer: result.buffer, pageCount: result.pageCount });
+      }
+      // Dispatch a lightweight update - we already popped undo in UNDO action
+      // Just need to refresh buffer. Use OPEN_FILE with existing working path.
+      dispatch({
+        type: 'OPEN_FILE',
+        path: activeFile.path,
+        workingPath: activeFile.workingPath,
+        name: activeFile.name,
+        pageCount: result.pageCount,
+        buffer: result.buffer,
+      });
+    }
+  }, [activeFile, state.files, reloadFile, dispatch]);
+
+  const handleSave = useCallback(async () => {
+    if (!activeFile) return;
+    await file.saveAs(activeFile.workingPath, activeFile.path);
+    dispatch({ type: 'MARK_SAVED', path: activeFile.path });
+  }, [activeFile, dispatch]);
+
+  const handleSaveAs = useCallback(async () => {
+    if (!activeFile) return;
+    const dest = await saveFile(activeFile.name);
+    if (!dest) return;
+    await file.saveAs(activeFile.workingPath, dest);
+    dispatch({ type: 'MARK_SAVED', path: activeFile.path });
+  }, [activeFile, saveFile, dispatch]);
+
+  // Close file with unsaved changes prompt
+  const handleCloseFile = useCallback(async (filePath: string) => {
+    const f = state.files.get(filePath);
+    if (f?.dirty) {
+      const result = await showConfirm(
+        `"${f.name}" has unsaved changes. Save before closing?`
+      );
+      if (result === 'cancel') return;
+      if (result === 'save') {
+        await file.saveAs(f.workingPath, f.path);
+      }
+    }
+    dispatch({ type: 'CLOSE_FILE', path: filePath });
+  }, [state.files, dispatch, showConfirm]);
+
+  // Close all open files with unsaved changes prompt
+  const handleCloseAll = useCallback(async () => {
+    const allOpen = Array.from(state.files.values());
+    const dirtyFiles = allOpen.filter((f) => f.dirty);
+    if (dirtyFiles.length > 0) {
+      const names = dirtyFiles.map((f) => f.name).join(', ');
+      const result = await showConfirm(
+        `Unsaved changes in: ${names}. Save before closing all?`
+      );
+      if (result === 'cancel') return;
+      if (result === 'save') {
+        for (const f of dirtyFiles) {
+          await file.saveAs(f.workingPath, f.path);
+        }
+      }
+    }
+    for (const f of allOpen) {
+      dispatch({ type: 'CLOSE_FILE', path: f.path });
+    }
+  }, [state.files, dispatch, showConfirm]);
+
+  // Keep a ref to current files so the close handler always sees latest state
+  const filesRef = useRef(state.files);
+  filesRef.current = state.files;
+
+  // Handle window close — Rust intercepts CloseRequested and emits app:beforeClose
+  useEffect(() => {
+    const unlisten = app.onBeforeClose(async () => {
+      const minimizeToTray = getSettings().minimizeToTray === true;
+
+      // If no dirty files, either minimize to tray or close
+      const dirtyFiles = Array.from(filesRef.current.values()).filter((f) => f.dirty);
+      if (dirtyFiles.length === 0) {
+        if (minimizeToTray) {
+          await app.hideToTray();
+        } else {
+          await app.confirmClose();
+        }
+        return;
+      }
+      const names = dirtyFiles.map((f) => f.name).join(', ');
+      const result = await showConfirm(
+        `Unsaved changes in: ${names}. Save before closing?`
+      );
+      if (result === 'cancel') {
+        return; // Do nothing — window stays open
+      }
+      if (result === 'save') {
+        for (const f of dirtyFiles) {
+          await file.saveAs(f.workingPath, f.path);
+        }
+      }
+      if (minimizeToTray) {
+        await app.hideToTray();
+      } else {
+        await app.confirmClose();
+      }
+    });
+    return () => { unlisten.then((fn) => fn()); };
+  }, []);
+
+  // Handle tray actions (Quick Merge)
+  useEffect(() => {
+    const unlisten = app.onTrayAction((action: string) => {
+      if (action === 'merge') {
+        setView('operations');
+        setActiveOp('merge');
+      }
+    });
+    return () => { unlisten.then((fn) => fn()); };
+  }, []);
+
+  // Handle files opened via file association, context menu, or second instance
+  useEffect(() => {
+    const unlisten = app.onOpenFile(async (data: { files: string[]; merge: boolean }) => {
+      await openByPaths(data.files);
+      if (data.merge && data.files.length > 0) {
+        setView('operations');
+        setActiveOp('merge');
+      } else {
+        setView('pages');
+      }
+    });
+    return () => { unlisten.then((fn) => fn()); };
+  }, [openByPaths]);
+
+  // Test harness — only compiled in when VITE_E2E=1 was set at build time.
+  const harnessListenersRef = useRef<Set<(s: TestStateSnapshot) => void>>(new Set());
+  const harnessSnapshotRef = useRef<() => TestStateSnapshot>(() => ({
+    view: 'welcome', activeOp: 'merge', fileCount: 0,
+    activeFileId: null, activeFile: null,
+  }));
+  harnessSnapshotRef.current = () => ({
+    view,
+    activeOp,
+    fileCount: state.files.size,
+    activeFileId: state.activeFileId,
+    activeFile: activeFile
+      ? {
+          name: activeFile.name,
+          path: activeFile.path,
+          workingPath: activeFile.workingPath,
+          pageCount: activeFile.pageCount,
+          dirty: activeFile.dirty,
+        }
+      : null,
+  });
+
+  useEffect(() => {
+    if (!TEST_HARNESS_ENABLED) return;
+    installTestHarness({
+      openByPaths: (paths) => openByPaths(paths),
+      setView: (v) => setView(v),
+      setActiveOp: (op) => setActiveOp(op as Operation),
+      getStateSnapshot: () => harnessSnapshotRef.current(),
+      subscribe: (listener) => {
+        harnessListenersRef.current.add(listener);
+        return () => harnessListenersRef.current.delete(listener);
+      },
+    });
+  }, [openByPaths]);
+
+  // Notify harness subscribers on every state-relevant change.
+  useEffect(() => {
+    if (!TEST_HARNESS_ENABLED) return;
+    const snap = harnessSnapshotRef.current();
+    harnessListenersRef.current.forEach((l) => l(snap));
+  }, [view, activeOp, state.files, state.activeFileId, activeFile?.dirty, activeFile?.pageCount]);
+
+  const Panel = panels[activeOp];
+  const canUndo = activeFile ? activeFile.undoStack.length > 0 : false;
+
+  return (
+    <DropZone onFilesDropped={handleFilesDropped}>
+    <div className="h-screen bg-neutral-900 text-neutral-100 flex flex-col overflow-hidden">
+      {/* Header */}
+      <header data-testid="app-header" className="flex items-center justify-between px-4 py-2 border-b border-neutral-800 shrink-0">
+        <div className="flex items-center gap-3">
+          <h1 data-testid="app-title" className="text-lg font-semibold tracking-tight">Spectra PDF</h1>
+          <span data-testid="app-version" className="text-[10px] text-neutral-500 bg-neutral-800 px-1.5 py-0.5 rounded">{appVersion}</span>
+          <button data-testid="settings-btn" onClick={() => setShowSettings(true)} className="w-6 h-6 flex items-center justify-center text-neutral-500 hover:text-neutral-300 rounded transition-colors" title="Settings">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+            </svg>
+          </button>
+        </div>
+        <div className="flex items-center gap-2">
+          {/* Undo / Save — only in pages view with an active file */}
+          {view === 'pages' && activeFile && (
+            <>
+              <button data-testid="undo-btn" onClick={handleUndo} disabled={!canUndo} className="px-2 py-1 text-xs bg-neutral-700 hover:bg-neutral-600 disabled:opacity-30 rounded font-medium" title="Undo last action">
+                Undo
+              </button>
+              <button data-testid="save-btn" onClick={handleSave} disabled={!activeFile.dirty} className="px-2 py-1 text-xs bg-neutral-700 hover:bg-neutral-600 disabled:opacity-30 rounded font-medium" title="Save to original file">
+                Save
+              </button>
+              <button data-testid="save-as-btn" onClick={handleSaveAs} className="px-2 py-1 text-xs bg-neutral-700 hover:bg-neutral-600 rounded font-medium" title="Save as new file">
+                Save As
+              </button>
+            </>
+          )}
+          <button data-testid="open-pdf-btn" onClick={handleOpenFile} className="px-3 py-1 text-xs text-white bg-blue-600 hover:bg-blue-500 rounded font-medium">
+            Open PDF
+          </button>
+          <div data-testid="view-switcher" className="flex bg-neutral-800 rounded overflow-hidden">
+            <button
+              data-testid="view-home"
+              onClick={() => setView('welcome')}
+              className={`px-3 py-1 text-xs font-medium ${view === 'welcome' ? 'bg-neutral-600 text-white' : 'text-neutral-400 hover:text-neutral-200'}`}
+            >
+              Home
+            </button>
+            <button
+              data-testid="view-tools"
+              onClick={() => setView('operations')}
+              className={`px-3 py-1 text-xs font-medium ${view === 'operations' ? 'bg-neutral-600 text-white' : 'text-neutral-400 hover:text-neutral-200'}`}
+            >
+              Tools
+            </button>
+            <button
+              data-testid="view-pages"
+              onClick={() => setView('pages')}
+              className={`px-3 py-1 text-xs font-medium ${view === 'pages' ? 'bg-neutral-600 text-white' : 'text-neutral-400 hover:text-neutral-200'}`}
+            >
+              Pages
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <UpdateBar />
+
+      <div className="flex flex-1 overflow-hidden">
+        {/* Sidebar — operations + open files in tools view */}
+        {view === 'operations' && (
+          <div className="flex flex-col shrink-0 border-r border-neutral-800">
+            {allFiles.length > 0 && (
+              <div className="w-48 border-b border-neutral-800 py-2 shrink-0">
+                <div className="flex items-center justify-between px-4 pb-1">
+                <span className="text-[10px] uppercase tracking-widest text-neutral-300 font-semibold">Active File</span>
+                <button onClick={handleCloseAll} className="text-neutral-500 hover:text-red-400 transition-colors" title="Close all files">
+                  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><path d="M1 1l8 8M9 1l-8 8"/></svg>
+                </button>
+              </div>
+                {allFiles.map((f) => (
+                  <div key={f.path} className="flex items-center group">
+                    <button
+                      onClick={() => dispatch({ type: 'SET_ACTIVE_FILE', path: f.path })}
+                      className={`flex-1 px-4 py-1.5 text-left text-sm truncate transition-colors ${
+                        f.dirty ? 'italic' : ''
+                      } ${
+                        state.activeFileId === f.path ? 'bg-neutral-700 text-white' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'
+                      }`}
+                      title={f.path}
+                    >
+                      {f.dirty && <span className="text-amber-400 mr-1 not-italic">*</span>}
+                      {f.name}
+                    </button>
+                    <button
+                      onClick={() => handleCloseFile(f.path)}
+                      className="px-2 text-neutral-500 hover:text-red-400 opacity-0 group-hover:opacity-100 text-xs"
+                    >
+                      x
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <Sidebar active={activeOp} onSelect={setActiveOp} />
+          </div>
+        )}
+
+        {/* File tabs — only in pages view, resizable */}
+        {view === 'pages' && state.files.size > 0 && (
+          <div
+            className="bg-neutral-850 border-r border-neutral-800 flex flex-col py-2 shrink-0 overflow-y-auto relative"
+            style={{ width: pagesSidebarWidth, minWidth: 148, maxWidth: 400 }}
+          >
+            <div className="flex items-center justify-between px-4 pb-2">
+              <span className="text-[10px] uppercase tracking-widest text-neutral-300 font-semibold">Open Files</span>
+              <button onClick={handleCloseAll} className="text-neutral-500 hover:text-red-400 transition-colors" title="Close all files">
+                <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><path d="M1 1l8 8M9 1l-8 8"/></svg>
+              </button>
+            </div>
+            {Array.from(state.files.values()).map((f) => (
+              <div key={f.path} className="flex items-center group">
+                <button
+                  onClick={() => dispatch({ type: 'SET_ACTIVE_FILE', path: f.path })}
+                  className={`flex-1 px-4 py-1.5 text-left text-sm truncate transition-colors ${
+                    f.dirty ? 'italic' : ''
+                  } ${
+                    state.activeFileId === f.path ? 'bg-neutral-700 text-white' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'
+                  }`}
+                  title={f.path}
+                >
+                  {f.dirty && <span className="text-amber-400 mr-1 not-italic">*</span>}
+                  {f.name}
+                  <span className="text-neutral-500 ml-1 text-xs">{f.pageCount}p</span>
+                </button>
+                <button
+                  onClick={() => handleCloseFile(f.path)}
+                  className="px-2 text-neutral-500 hover:text-red-400 opacity-0 group-hover:opacity-100 text-xs"
+                >
+                  x
+                </button>
+              </div>
+            ))}
+            {/* Resize handle */}
+            <div
+              className="absolute top-0 right-0 w-1 h-full cursor-col-resize hover:bg-blue-500/40 active:bg-blue-500/60 transition-colors"
+              onMouseDown={(e) => {
+                e.preventDefault();
+                const startX = e.clientX;
+                const startW = pagesSidebarWidth;
+                const onMove = (ev: MouseEvent) => {
+                  const newW = Math.min(400, Math.max(148, startW + ev.clientX - startX));
+                  setPagesSidebarWidth(newW);
+                };
+                const onUp = () => {
+                  document.removeEventListener('mousemove', onMove);
+                  document.removeEventListener('mouseup', onUp);
+                };
+                document.addEventListener('mousemove', onMove);
+                document.addEventListener('mouseup', onUp);
+              }}
+            />
+          </div>
+        )}
+
+        {/* Main area */}
+        <main className="flex-1 flex flex-col overflow-hidden">
+          {view === 'welcome' ? (
+            <WelcomeScreen onAction={handleWelcomeAction} recentFiles={recentFiles} onSkipChanged={() => {}} onClearRecent={() => { setRecentFiles([]); localStorage.removeItem('spectra-recent'); }} />
+          ) : view === 'operations' ? (
+            <div className="flex-1 flex flex-col p-6 min-h-0">
+              <h2 className="text-lg font-medium mb-4 shrink-0">{titles[activeOp]}</h2>
+              <div className="flex-1 min-h-0">
+                {activeOp === 'extract_text' ? (
+                  <ExtractTextPanel initialPage={extractPage} onConsumeInitialPage={() => setExtractPage(null)} />
+                ) : (
+                  <Panel />
+                )}
+              </div>
+
+            </div>
+          ) : activeFile && activeFile.buffer ? (
+            state.activePage ? (
+              <PageInspector
+                buffer={activeFile.buffer}
+                page={state.activePage}
+                onClose={() => dispatch({ type: 'SET_ACTIVE_PAGE', page: null })}
+                onRotate={handleRotatePage}
+                onDelete={handleDeletePage}
+              />
+            ) : (
+              <div className="flex-1 overflow-y-auto">
+                <ThumbnailGrid
+                  buffer={activeFile.buffer}
+                  pageCount={activeFile.pageCount}
+                  selectedPages={state.selectedPages}
+                  activePage={state.activePage}
+                  onSelectPage={(p) => dispatch({ type: 'SELECT_PAGE', page: p })}
+                  onTogglePage={(p) => dispatch({ type: 'TOGGLE_PAGE', page: p })}
+                  onActivatePage={(p) => dispatch({ type: 'SET_ACTIVE_PAGE', page: p })}
+                  onRotate={handleRotatePage}
+                  onDelete={handleDeletePage}
+                  onExtractText={handleExtractTextFromPage}
+                />
+              </div>
+            )
+          ) : (
+            <div className="flex-1 flex items-center justify-center text-neutral-500">
+              <div className="text-center">
+                <p className="text-lg mb-1">No file open</p>
+                <p className="text-sm">Click "Open PDF" to view pages</p>
+              </div>
+            </div>
+          )}
+        </main>
+      </div>
+
+      {/* Operation queue */}
+      <OperationQueue items={queue} onClear={clearQueue} />
+
+      {/* Settings modal — accessible from any view */}
+      {showSettings && (
+        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center" onClick={() => setShowSettings(false)}>
+          <div className="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl w-[500px] max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between px-5 py-3 border-b border-neutral-800">
+              <h3 className="text-sm font-semibold">Settings</h3>
+              <button onClick={() => setShowSettings(false)} className="text-neutral-500 hover:text-neutral-300 text-sm">Close</button>
+            </div>
+            <div className="p-5">
+              <SettingsPanel />
+            </div>
+          </div>
+        </div>
+      )}
+      {/* 3-choice confirm dialog (Save / Don't Save / Cancel) */}
+      <ConfirmDialog
+        open={confirmState !== null}
+        message={confirmState?.message ?? ''}
+        onResult={handleConfirmResult}
+      />
+      {/* Password prompt for encrypted PDFs */}
+      <PasswordDialog
+        open={passwordState !== null}
+        fileName={passwordState?.fileName ?? ''}
+        error={passwordState?.error}
+        onResult={handlePasswordResult}
+      />
+    </div>
+    </DropZone>
+  );
+}
+
+export function App(): React.ReactElement {
+  return (
+    <QueueProvider>
+      <AppStateProvider>
+        <AppContent />
+      </AppStateProvider>
+    </QueueProvider>
+  );
+}

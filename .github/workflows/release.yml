@@ -1,0 +1,63 @@
+name: Release
+
+# Tag a version (e.g. v0.9.0) to build, sign, and publish a GitHub release.
+# The updater manifest (latest.json) is generated and signed automatically by
+# tauri-action because the updater is configured with a pubkey and
+# bundle.createUpdaterArtifacts is enabled.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & publish (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('src-tauri/Cargo.lock') }}
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Provision embedded Python (vendored)
+        run: powershell -ExecutionPolicy Bypass -File scripts/setup-python-embed.ps1
+        shell: pwsh
+
+      - name: Vendor upstream Ghostscript
+        run: powershell -ExecutionPolicy Bypass -File scripts/bundle-ghostscript.ps1
+        shell: pwsh
+
+      - name: Build, sign, and publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Updater signing — store the private key as a repository secret.
+          # The key has no password, so the password is an empty string (no secret needed).
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Spectra PDF ${{ github.ref_name }}"
+          releaseBody: "See CHANGELOG.md for details. The installer is unsigned (no code-signing certificate); SmartScreen may warn on first run."
+          releaseDraft: false
+          prerelease: false

@@ -1,0 +1,58 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Build output
+dist/
+out/
+*.tsbuildinfo
+
+# Tauri / Rust
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# Environment
+.env
+.env.local
+
+# IDE / tooling
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Python
+*.egg-info/
+*.egg
+.eggs/
+
+# Embedded runtimes (downloaded/copied during build, not committed)
+resources/python/
+resources/ghostscript/
+
+# Test
+coverage/
+.pytest_cache/
+htmlcov/
+
+# E2E (WebdriverIO + tauri-driver) — runtime artifacts
+e2e-tests/.wdio-runs/
+e2e-tests/logs/
+
+# Portable staging (built artifacts, not source)
+src-tauri/target/release/portable/
+
+# Internal planning docs (not part of the public release)
+roadmap.md
+NEXT_SESSION.md
+project-manifest.json
+.updater-test/

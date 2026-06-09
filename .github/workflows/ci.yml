@@ -1,0 +1,155 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  lint-and-build:
+    name: Lint & Build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Lint (ESLint — errors gate; advisory warnings are not CI noise)
+        run: npm run lint -- --quiet
+
+      - name: Build renderer (Vite)
+        run: npm run build:renderer
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+
+      - name: Create resource stubs for Tauri build script
+        run: |
+          mkdir -p resources/python
+          mkdir -p resources/ghostscript
+        shell: bash
+
+      - name: Check Rust compilation
+        run: cd src-tauri && cargo check
+
+  test-engine:
+    name: Python Engine Tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Install Python dependencies
+        run: pip install pikepdf pdfminer.six pytest
+
+      - name: Run engine + validation tests
+        run: python -m pytest tests/test_engine.py tests/test_validation.py -v
+
+  audit:
+    name: Dependency Audit
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: npm audit (production)
+        run: npm audit --production --audit-level=high
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo audit
+        run: |
+          cargo install cargo-audit
+          cd src-tauri && cargo audit
+
+  e2e:
+    name: E2E (WebdriverIO + tauri-driver)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('src-tauri/Cargo.lock') }}
+
+      - name: Install Node dependencies (root)
+        run: npm ci
+
+      - name: Install Node dependencies (e2e)
+        run: npm ci
+        working-directory: e2e-tests
+
+      - name: Provision embedded Python for engine sidecar
+        run: powershell -ExecutionPolicy Bypass -File scripts/setup-python-embed.ps1
+        shell: pwsh
+
+      - name: Stub Ghostscript binaries (e2e suite does not exercise GS paths)
+        run: |
+          mkdir -p resources/ghostscript
+          touch resources/ghostscript/gswin64c.exe
+          touch resources/ghostscript/gsdll64.dll
+        shell: bash
+
+      - name: Build Tauri binary (debug, frontend embedded, no installer)
+        run: npx tauri build --debug --no-bundle
+        env:
+          VITE_E2E: "1"
+
+      - name: Install tauri-driver
+        run: cargo install tauri-driver --locked
+
+      - name: Install msedgedriver matching runner Edge
+        run: |
+          cargo install --git https://github.com/chippers/msedgedriver-tool
+          $cargoBin = "$env:USERPROFILE\.cargo\bin"
+          Push-Location $cargoBin
+          msedgedriver-tool
+          Pop-Location
+          echo "$cargoBin" >> $env:GITHUB_PATH
+        shell: pwsh
+
+      - name: Run WebdriverIO suite
+        run: npm test
+        working-directory: e2e-tests

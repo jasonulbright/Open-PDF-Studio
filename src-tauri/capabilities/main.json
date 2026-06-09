@@ -1,0 +1,13 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-utils/schema.json",
+  "identifier": "main-capability",
+  "description": "Main window capabilities",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-set-theme",
+    "updater:default",
+    "updater:allow-check",
+    "updater:allow-download-and-install"
+  ]
+}

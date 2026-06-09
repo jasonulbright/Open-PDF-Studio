@@ -1,0 +1,5 @@
+%PDF-1.7
+%garbage-not-a-real-pdf
+This file deliberately fails PDF structural parsing to verify
+that Spectra PDF refuses to load broken input rather than crashing
+or silently truncating. Used by specs/malformed-refuse.spec.ts.

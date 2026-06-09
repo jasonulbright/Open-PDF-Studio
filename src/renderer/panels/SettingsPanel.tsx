@@ -1,0 +1,342 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import { getCurrentWindow } from '@tauri-apps/api/window';
+import { app, type GsInfo } from '../lib/tauri-bridge';
+import { StatusBar } from '../components/StatusBar';
+
+interface Settings {
+  gsPath: string;
+  gsSource: 'builtin' | 'external';
+  defaultOutputDir: string;
+  compressionQuality: string;
+  theme: string;
+  expandAllTools: boolean;
+  minimizeToTray: boolean;
+  startMinimized: boolean;
+}
+
+function getSystemTheme(): string {
+  return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+}
+
+const DEFAULTS: Settings = {
+  gsPath: '',
+  gsSource: 'builtin',
+  defaultOutputDir: '',
+  compressionQuality: 'ebook',
+  theme: 'system',
+  expandAllTools: false,
+  minimizeToTray: false,
+  startMinimized: false,
+};
+
+// Cached GS info for display
+let cachedBundledGs: GsInfo | null = null;
+let cachedExternalGs: GsInfo | null = null;
+
+// Initialize GS path from main process (bundled)
+let gsPathResolved = false;
+async function resolveGsPath(): Promise<void> {
+  if (gsPathResolved) return;
+  gsPathResolved = true;
+  try {
+    cachedBundledGs = await app.getBundledGsInfo();
+  } catch {
+    // Fall back to direct path resolution.
+    const bundledPath = await app.getGsPath();
+    cachedBundledGs = { path: bundledPath, version: '', product: 'GPL Ghostscript', vendor: 'Artifex Software' };
+  }
+  try {
+    cachedExternalGs = await app.detectExternalGs();
+  } catch {
+    cachedExternalGs = null;
+  }
+  // Ensure gsPath is set for operations; auto-heal if external GS disappeared
+  const current = loadSettings();
+  if (!current.gsPath || current.gsSource === 'builtin' ||
+      (current.gsSource === 'external' && !cachedExternalGs)) {
+    saveSettings({ ...current, gsPath: cachedBundledGs.path, gsSource: 'builtin' });
+  }
+}
+resolveGsPath();
+
+
+function loadSettings(): Settings {
+  try {
+    const stored = localStorage.getItem('spectra-settings');
+    if (!stored) return DEFAULTS;
+    const parsed = JSON.parse(stored);
+    // Fix string-boolean corruption from earlier bug
+    if (typeof parsed.expandAllTools === 'string') {
+      parsed.expandAllTools = parsed.expandAllTools === 'true';
+    }
+    if (typeof parsed.minimizeToTray === 'string') {
+      parsed.minimizeToTray = parsed.minimizeToTray === 'true';
+    }
+    // Default gsSource to builtin when unset.
+    if (!parsed.gsSource) {
+      parsed.gsSource = 'builtin';
+    }
+    return { ...DEFAULTS, ...parsed };
+  } catch { return DEFAULTS; }
+}
+
+function saveSettings(settings: Settings): void {
+  localStorage.setItem('spectra-settings', JSON.stringify(settings));
+}
+
+export function getSettings(): Settings {
+  return loadSettings();
+}
+
+/** Apply the theme to the document root and window title bar. */
+export function applyTheme(theme?: string): void {
+  const resolved = theme ?? loadSettings().theme;
+  if (resolved === 'system') {
+    // Reset window theme to OS default, then read actual system preference after WebView2 updates
+    getCurrentWindow().setTheme(null).then(() => {
+      const effective = getSystemTheme();
+      document.documentElement.setAttribute('data-theme', effective);
+    }).catch(() => {
+      document.documentElement.setAttribute('data-theme', getSystemTheme());
+    });
+    applyAccentColor();
+  } else {
+    document.documentElement.setAttribute('data-theme', resolved);
+    getCurrentWindow().setTheme(resolved === 'light' ? 'light' : 'dark').catch(() => {});
+    clearAccentColor();
+  }
+}
+
+/** Apply Windows accent color as CSS custom properties. */
+function applyAccentColor(): void {
+  app.getSystemAccentColor().then((hex) => {
+    if (!hex) return;
+    const root = document.documentElement;
+    root.style.setProperty('--accent', hex);
+    // Generate a lighter hover variant by blending with white
+    const r = parseInt(hex.slice(1, 3), 16);
+    const g = parseInt(hex.slice(3, 5), 16);
+    const b = parseInt(hex.slice(5, 7), 16);
+    const lighten = (v: number) => Math.min(255, v + 30);
+    root.style.setProperty('--accent-hover', `rgb(${lighten(r)}, ${lighten(g)}, ${lighten(b)})`);
+    root.style.setProperty('--accent-muted', `rgba(${r}, ${g}, ${b}, 0.3)`);
+    root.style.setProperty('--accent-subtle', `rgba(${r}, ${g}, ${b}, 0.2)`);
+  }).catch(() => {});
+}
+
+function clearAccentColor(): void {
+  const root = document.documentElement;
+  root.style.removeProperty('--accent');
+  root.style.removeProperty('--accent-hover');
+  root.style.removeProperty('--accent-muted');
+  root.style.removeProperty('--accent-subtle');
+}
+
+// Apply theme immediately on module load
+applyTheme();
+
+// Re-apply when system theme changes (only matters when theme === 'system')
+window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => {
+  if (loadSettings().theme === 'system') applyTheme('system');
+});
+
+// Re-read accent color when app regains focus (user may have changed it in Windows Settings)
+getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+  if (focused && loadSettings().theme === 'system') applyAccentColor();
+});
+
+function GsInfoDisplay({ info, label }: { info: GsInfo | null; label: string }): React.ReactElement | null {
+  if (!info) return null;
+  return (
+    <div className="px-3 py-2 bg-neutral-800 border border-neutral-700 rounded text-sm">
+      <div className="font-medium text-neutral-200">{label}</div>
+      <div className="flex flex-col gap-0.5 mt-1 text-xs text-neutral-400">
+        <span>{info.product}</span>
+        <span>Version {info.version}</span>
+        <span>Vendor: {info.vendor}</span>
+      </div>
+    </div>
+  );
+}
+
+export function SettingsPanel(): React.ReactElement {
+  const [settings, setSettings] = useState<Settings>(loadSettings);
+  const [status, setStatus] = useState('');
+  const [bundledGs, setBundledGs] = useState<GsInfo | null>(cachedBundledGs);
+  const [externalGs, setExternalGs] = useState<GsInfo | null>(cachedExternalGs);
+  const [startWithWindows, setStartWithWindows] = useState(false);
+
+  useEffect(() => {
+    // Refresh GS info when panel opens (cached values may not be ready yet)
+    app.getBundledGsInfo().then((info) => {
+      cachedBundledGs = info;
+      setBundledGs(info);
+    }).catch(() => {});
+    app.detectExternalGs().then((info) => {
+      cachedExternalGs = info;
+      setExternalGs(info);
+      // Auto-heal: if external was selected but is now gone, reset to built-in
+      if (!info && loadSettings().gsSource === 'external' && cachedBundledGs) {
+        const healed = { ...loadSettings(), gsSource: 'builtin' as const, gsPath: cachedBundledGs.path };
+        saveSettings(healed);
+        setSettings(healed);
+      }
+    }).catch(() => {});
+    // Load startup state from registry (Start with Windows toggle)
+    app.getStartupEnabled().then(([enabled]) => {
+      setStartWithWindows(enabled);
+    }).catch(() => {});
+  }, []);
+
+  const update = useCallback((key: keyof Settings, value: string | boolean) => {
+    setSettings((prev) => {
+      const next = { ...prev, [key]: value };
+      saveSettings(next);
+      return next;
+    });
+    if (key === 'theme') applyTheme(value as string);
+    setStatus('Settings saved');
+  }, []);
+
+  const handleGsSourceChange = useCallback((source: 'builtin' | 'external') => {
+    const gsPath = source === 'external' && externalGs ? externalGs.path : (bundledGs?.path ?? '');
+    setSettings((prev) => {
+      const next = { ...prev, gsSource: source, gsPath };
+      saveSettings(next);
+      return next;
+    });
+    setStatus('Settings saved');
+  }, [bundledGs, externalGs]);
+
+  const activeGs = settings.gsSource === 'external' && externalGs ? externalGs : bundledGs;
+
+  return (
+    <div className="flex flex-col gap-6">
+      <div>
+        <label className="block text-sm text-neutral-400 mb-2">Ghostscript Engine</label>
+        <GsInfoDisplay info={activeGs} label={settings.gsSource === 'external' ? 'External (System)' : 'Built-in (Bundled)'} />
+        {externalGs && (
+          <div className="flex gap-2 mt-2">
+            <button
+              onClick={() => handleGsSourceChange('builtin')}
+              className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
+                settings.gsSource === 'builtin'
+                  ? 'bg-blue-600 text-white'
+                  : 'bg-neutral-700 hover:bg-neutral-600 text-neutral-300'
+              }`}
+            >
+              Built-in
+            </button>
+            <button
+              onClick={() => handleGsSourceChange('external')}
+              className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
+                settings.gsSource === 'external'
+                  ? 'bg-blue-600 text-white'
+                  : 'bg-neutral-700 hover:bg-neutral-600 text-neutral-300'
+              }`}
+            >
+              External
+            </button>
+          </div>
+        )}
+        <p className="text-xs text-neutral-500 mt-1">Used for Compress and PDF/A conversion</p>
+      </div>
+
+      <div>
+        <label className="block text-sm text-neutral-400 mb-1">Default Compression Quality</label>
+        <select
+          value={settings.compressionQuality}
+          onChange={(e) => update('compressionQuality', e.target.value)}
+          className="px-3 py-1.5 bg-neutral-800 border border-neutral-700 rounded text-sm"
+        >
+          <option value="screen">Screen (72 dpi, smallest)</option>
+          <option value="ebook">Ebook (150 dpi)</option>
+          <option value="printer">Printer (300 dpi)</option>
+          <option value="prepress">Prepress (300 dpi, highest)</option>
+        </select>
+      </div>
+
+      <div>
+        <label className="block text-sm text-neutral-400 mb-1">Theme</label>
+        <select
+          value={settings.theme}
+          onChange={(e) => update('theme', e.target.value)}
+          className="px-3 py-1.5 bg-neutral-800 border border-neutral-700 rounded text-sm"
+        >
+          <option value="system">System</option>
+          <option value="dark">Dark</option>
+          <option value="light">Light</option>
+        </select>
+      </div>
+
+      <label className="flex items-center gap-2 cursor-pointer">
+        <input
+          type="checkbox"
+          checked={settings.expandAllTools}
+          onChange={() => update('expandAllTools', !settings.expandAllTools)}
+          className="rounded bg-neutral-800 border-neutral-700"
+        />
+        <span className="text-sm text-neutral-400">Expand all tool groups in sidebar</span>
+      </label>
+
+      <label className="flex items-center gap-2 cursor-pointer">
+        <input
+          type="checkbox"
+          checked={settings.minimizeToTray}
+          onChange={() => {
+            const next = !settings.minimizeToTray;
+            update('minimizeToTray', next);
+            // If disabling tray, also disable start-minimized and update startup entry
+            if (!next && settings.startMinimized) {
+              update('startMinimized', false);
+              app.setStartMinimized(false).catch(() => {});
+              if (startWithWindows) {
+                app.setStartupEnabled(true, false).catch(() => {});
+              }
+            }
+          }}
+          className="rounded bg-neutral-800 border-neutral-700"
+        />
+        <span className="text-sm text-neutral-400">Minimize to system tray on close</span>
+      </label>
+
+      {settings.minimizeToTray && (
+        <label className="flex items-center gap-2 cursor-pointer ml-4">
+          <input
+            type="checkbox"
+            checked={settings.startMinimized}
+            onChange={() => {
+              const next = !settings.startMinimized;
+              update('startMinimized', next);
+              // Write to Rust-readable config file (no window flash on startup)
+              app.setStartMinimized(next).catch(() => {});
+              // Update startup registry entry if Start with Windows is enabled
+              if (startWithWindows) {
+                app.setStartupEnabled(true, next).catch(() => {});
+              }
+            }}
+            className="rounded bg-neutral-800 border-neutral-700"
+          />
+          <span className="text-sm text-neutral-400">Start minimized to tray</span>
+        </label>
+      )}
+
+      <label className="flex items-center gap-2 cursor-pointer">
+        <input
+          type="checkbox"
+          checked={startWithWindows}
+          onChange={() => {
+            const next = !startWithWindows;
+            setStartWithWindows(next);
+            app.setStartupEnabled(next, next ? settings.startMinimized : false).catch(() => {});
+            setStatus('Settings saved');
+          }}
+          className="rounded bg-neutral-800 border-neutral-700"
+        />
+        <span className="text-sm text-neutral-400">Start with Windows</span>
+      </label>
+
+      <StatusBar message={status} />
+    </div>
+  );
+}

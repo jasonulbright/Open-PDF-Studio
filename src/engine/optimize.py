@@ -1,0 +1,66 @@
+"""PDF optimization using pikepdf (lossless, no Ghostscript)."""
+
+from pathlib import Path
+
+import pikepdf
+
+
+def _rebrand_xmptk(path: Path) -> None:
+    """Replace pikepdf's xmptk attribute. Same byte length to preserve linearization."""
+    data = path.read_bytes()
+    patched = data.replace(b'xmptk="pikepdf"', b'xmptk="SpecPDF"')
+    if patched != data:
+        path.write_bytes(patched)
+
+
+def optimize(
+    file: str,
+    output: str,
+    linearize: bool = True,
+    strip_metadata: bool = False,
+    compress_streams: bool = True,
+) -> dict:
+    """Optimize a PDF without re-rendering.
+
+    Args:
+        file: Input PDF path.
+        output: Output PDF path.
+        linearize: Enable web-optimized (linearized) output.
+        strip_metadata: Remove all XMP and document info metadata.
+        compress_streams: Use object streams for smaller output.
+    """
+    input_path = Path(file)
+    output_path = Path(output)
+
+    with pikepdf.open(file) as pdf:
+        if strip_metadata:
+            with pdf.open_metadata(
+                set_pikepdf_as_editor=False, update_docinfo=False
+            ) as meta:
+                meta.clear()
+            if pikepdf.Name.Info in pdf.trailer:
+                del pdf.trailer[pikepdf.Name.Info]
+
+        stream_mode = (
+            pikepdf.ObjectStreamMode.generate
+            if compress_streams
+            else pikepdf.ObjectStreamMode.preserve
+        )
+
+        pdf.save(
+            output_path,
+            linearize=linearize,
+            object_stream_mode=stream_mode,
+        )
+
+    if strip_metadata:
+        _rebrand_xmptk(output_path)
+
+    return {
+        "output": str(output_path),
+        "original_size": input_path.stat().st_size,
+        "output_size": output_path.stat().st_size,
+        "linearized": linearize,
+        "metadata_stripped": strip_metadata,
+        "streams_compressed": compress_streams,
+    }
