@@ -2,7 +2,7 @@ import { resolve } from 'node:path';
 import { writeFileSync, existsSync, rmSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { expect } from '@wdio/globals';
-import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
+import { PDFDocument, StandardFonts } from 'pdf-lib';
 import {
   waitForHarness,
   openByPaths,
@@ -11,20 +11,20 @@ import {
   setReactInputValue,
 } from '../support/harness.js';
 
-// Phase 9.A5a — per-span colour on the paragraph editor: select a word in
-// the textarea, pick a colour, and only that range recolours. Asserted via
-// the re-listing (the recoloured range seeds its colour back into the
-// paragraph's spans — the working copy stream is compressed, so the listing
-// round-trip is the on-disk proof), plus undo removing it. Waits key on the
-// page id advancing past the pre-op id (the generation-tagged reindex; a
-// pure restyle keeps the text identical, so a text-only wait false-passes
-// on the stale listing — the A3 timing rule).
+// Phase 9.A5c — per-span size on the paragraph editor: select a word, set a
+// bigger size, and only that range grows (its line gains leading; the rest
+// keep theirs). Asserted via the re-listing (the paragraph lists back with
+// the larger size among its runs — the working copy stream is compressed, so
+// the listing round-trip is the on-disk proof), plus undo removing it. Waits
+// key on the page id advancing past the pre-op id (the A3 timing rule — a
+// pure restyle keeps the text identical).
 
 interface Para {
   index: number;
   text: string;
   lineCount: number;
   colors: string[];
+  sizes: number[];
 }
 
 async function editTextPageIds(): Promise<string[]> {
@@ -49,8 +49,6 @@ async function editParagraphOpen(pageId: string, index: number): Promise<void> {
   );
 }
 
-/** Set the textarea selection to a UTF-16 range and fire `select` so the
- * editor captures it (the colour swatch reads the captured selection). */
 async function selectRange(start: number, end: number): Promise<void> {
   await browser.execute<void, [number, number]>(
     function (s, e) {
@@ -93,27 +91,17 @@ async function waitForReindexed(
   );
 }
 
-describe('restyle span colour (Phase 9.A5a)', () => {
+describe('restyle span size (Phase 9.A5c)', () => {
   let tmp: string;
   let pdfPath: string;
 
   before(async () => {
-    tmp = mkdtempSync(resolve(tmpdir(), 'spectra-e2e-spancolor-'));
-    pdfPath = resolve(tmp, 'span-color.pdf');
+    tmp = mkdtempSync(resolve(tmpdir(), 'spectra-e2e-spansize-'));
+    pdfPath = resolve(tmp, 'span-size.pdf');
     const doc = await PDFDocument.create();
     const font = await doc.embedFont(StandardFonts.Helvetica);
     const page = doc.addPage([400, 300]);
-    // Blue base text: a per-span red then leaves the REST blue, so the
-    // re-listing carries BOTH colours — proof the recolour hit just the
-    // range, not the whole paragraph (a default-black base would omit its
-    // colour from the listing, making per-span and whole-para look alike).
-    page.drawText('Alpha beta gamma delta words', {
-      x: 60,
-      y: 200,
-      size: 14,
-      font,
-      color: rgb(0, 0, 1),
-    });
+    page.drawText('Alpha beta gamma delta words', { x: 40, y: 200, size: 14, font });
     writeFileSync(pdfPath, await doc.save());
   });
 
@@ -121,12 +109,12 @@ describe('restyle span colour (Phase 9.A5a)', () => {
     if (tmp && existsSync(tmp)) rmSync(tmp, { recursive: true, force: true });
   });
 
-  it('recolours a selected word; the colour round-trips; undo removes it', async function () {
+  it('enlarges a selected word (lists back at the larger size); undo removes it', async function () {
     this.timeout(120_000);
     await waitForHarness();
     await openByPaths([pdfPath]);
     await browser.waitUntil(
-      async () => ((await getState()).activeFile?.path ?? '').includes('span-color.pdf'),
+      async () => ((await getState()).activeFile?.path ?? '').includes('span-size.pdf'),
       { timeout: 15_000, timeoutMsg: 'fixture never became active' },
     );
     expect(await invokeAppCommand('tools.open.edit')).toBe(true);
@@ -134,41 +122,37 @@ describe('restyle span colour (Phase 9.A5a)', () => {
     const pageId = (await editTextPageIds())[0];
     const para = (await editParagraphs(pageId))[0];
     expect(para.text).toContain('Alpha beta gamma delta');
-    // Pristine: the blue base, no red yet. Capture the base hex (exact value
-    // is the engine's round-trip of rgb(0,0,1)) to assert it survives.
-    expect(para.colors).not.toContain('#ff0000');
-    const baseColor = para.colors[0];
-    expect(baseColor).toBeDefined();
+    // Pristine: one size (~14) across the paragraph.
+    expect(para.sizes.some((s) => s >= 28)).toBe(false);
 
-    // Open the editor, select "Alpha" (chars 0..5), pick red on the swatch.
+    // Open the editor, select "gamma" (chars 11..16), set size 28.
     await editParagraphOpen(pageId, para.index);
     await $('[data-testid="edit-para-input"]').waitForDisplayed({ timeout: 10_000 });
-    await selectRange(0, 5);
-    await setReactInputValue('[data-testid="edit-para-color"]', '#ff0000');
+    expect(para.text.slice(11, 16)).toBe('gamma');
+    await selectRange(11, 16);
+    await setReactInputValue('[data-testid="edit-para-size"]', '28');
     await browser.keys(['Enter']);
 
-    // The reindexed listing seeds the red back onto the paragraph's spans,
-    // with the text unchanged (a pure per-span restyle).
+    // The reindexed listing carries the larger size among the runs AND the
+    // ORIGINAL ~14 size for the rest — a per-span resize, not a whole-para
+    // one (which would list only 28). `sizes` is a structured field, so this
+    // stronger check costs nothing (round-34 LOW; unlike spec 56's byte-grep).
     await waitForReindexed(
       pageId,
-      // Red for the range AND the ORIGINAL base colour for the rest — a
-      // per-span recolour, not a whole-paragraph one (which would recolour
-      // every span red and drop the base entirely).
       (paras) =>
         paras.some(
-          (p) =>
-            p.text === para.text && p.colors.includes('#ff0000') && p.colors.includes(baseColor),
+          (p) => p.text === para.text && p.sizes.some((s) => s >= 28) && p.sizes.some((s) => s < 20),
         ),
-      'the recoloured span never listed back as a per-span recolour',
+      'the enlarged span never listed back as a per-span resize',
     );
 
-    // Undo restores the pristine (no red) listing.
+    // Undo restores the single-size listing.
     const preUndoId = (await editTextPageIds())[0];
     expect(await invokeAppCommand('edit.undo')).toBe(true);
     await waitForReindexed(
       preUndoId,
-      (paras) => paras.some((p) => p.text === para.text && !p.colors.includes('#ff0000')),
-      'undo did not remove the recoloured span',
+      (paras) => paras.some((p) => p.text === para.text && !p.sizes.some((s) => s >= 28)),
+      'undo did not remove the enlarged span',
     );
   });
 });
